@@ -37,3 +37,4 @@ class ActionCandidate:
   additive_cost_rub_h: float
   total_cost_rub_h: float
   explanation: str
+  issue_type: str  # 'EQUIPMENT_DP', 'FLASH_POINT', 'SULFUR', 'OPTIMIZATION_THROUGHPUT'
