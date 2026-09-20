@@ -1,5 +1,5 @@
 """
-Оркестратор мультиагентной системы: арбитраж целей, прогнозная валидация ограничений.
+Оркестратор мультиагентной системы: арбитраж целей, честная классификация статусов.
 """
 from typing import Dict, Any
 import pandas as pd
@@ -7,7 +7,6 @@ from config.settings import SPEC_K5, LIMITS
 from agents.quality_agent import DataQualityAgent
 from agents.reliability_agent import ReliabilityAgent
 from agents.optimization_agent import OptimizationAgent
-from models.blending_engine import BlendingEngine, BlendComponent
 
 
 class Orchestrator:
@@ -16,7 +15,7 @@ class Orchestrator:
         self.limits = LIMITS
         self.quality_agent = DataQualityAgent()
         self.reliability_agent = ReliabilityAgent()
-        self.opt_agent = OptimizationAgent()
+        self.opt_agent = OptimizationAgent(self.quality_agent, self.reliability_agent)
 
     def process_step(self, telemetry: pd.Series) -> Dict[str, Any]:
         raw_ts = telemetry.get('date', 'UNKNOWN_TIMESTAMP')
@@ -31,122 +30,169 @@ class Orchestrator:
                 "status": "REFUSAL_TO_RECOMMEND",
                 "verdict": "ОТКАЗ_ОТ_РЕКОМЕНДАЦИИ",
                 "reason": f"Надёжной рекомендации нет: лабораторное значение серы устарело (> {qr.source_age_hours:.1f} ч).",
-                "action_required": "Отобрать ручную пробу на ЛИМС и проверить ПАК Q21."
+                "action_required": "Отобрать ручную пробу на ЛИМС и проверить датчики ПАК.",
+                "explanation_for_operator": "Данные устарели. Автоматическое управление отключено ради безопасности."
             }
 
-        godt_s = qr.active_sulfur
-        blend_result = BlendingEngine.blend(
-            c_hydro=BlendComponent("ГОДТ", 0.85, godt_s, 836.0, 52.0, qr.flash_point, 348.0, -16.0),
-            c_kero=BlendComponent("Керосин", 0.15, 3.0, 795.0, 44.0, 48.0, 245.0, -48.0),
-            c_gasoil=BlendComponent("Газойль", 0.00, 28.0, 865.0, 48.0, 75.0, 362.0, -4.0),
-            dose_cetane_booster_kg_t=0.1,
-            dose_depressant_kg_t=0.0
+        state_dict = {
+            'T6': float(telemetry.get('T6', 355.0)),
+            'F9': float(telemetry.get('F9', 170.0)),
+            'W7': float(telemetry.get('W7', 0.140))
+        }
+        opt_res = self.opt_agent.optimize(state_dict, qr, rr)
+
+        current_blend_fl = 0.85 * qr.flash_point + 0.15 * 48.0
+        current_blend_s = 0.85 * qr.active_sulfur + 0.15 * 3.0
+
+        # Аварийный отказ, если даже вмешательство не спасает процесс
+        if not opt_res.is_feasible:
+            if current_blend_s > self.spec.MAX_SULFUR_MG_KG:
+                status = "CRITICAL_OFF_SPEC"
+                verdict = "КРИТИЧЕСКИЙ ВЫБРОС СЕРЫ"
+                reason_text = f"Сера смеси ({current_blend_s:.2f} мг/кг) превышает лимит 10 мг/кг. Коррекция невозможна!"
+            elif not rr.is_safe:
+                status = "EQUIPMENT_OVERLOAD"
+                verdict = "АВАРИЙНЫЙ ПЕРЕПАД ДАВЛЕНИЯ"
+                reason_text = (
+                    f"КРИТИЧЕСКИЙ ПЕРЕПАД P8={rr.dp_reactor_p8:.2f} МПа! "
+                    f"Снижение расхода сырья до минимума снизит перепад лишь до {opt_res.predicted_dp:.2f} МПа (выше лимита 0.80 МПа). "
+                    "Требуется аварийный останов установки!"
+                )
+            else:
+                status = "CRITICAL_OFF_SPEC"
+                verdict = "ВЫХОД ЗА ТЕХНОЛОГИЧЕСКИЙ КОРИДОР"
+                reason_text = "Параметры вышли за рамки допустимого режима регулирования."
+
+            return {
+                "timestamp": timestamp,
+                "status": status,
+                "verdict": verdict,
+                "detected_risk": qr.issues + rr.alerts,
+                "reason": reason_text,
+                "action_required": "Аварийный перевод потока в некондиционную емкость!",
+                "explanation_for_operator": reason_text
+            }
+
+        # Штатный режим
+        has_no_actions = (
+            abs(opt_res.delta_t6) < 0.1 and
+            abs(opt_res.delta_f9) < 0.1 and
+            abs(opt_res.delta_w7) < 0.001 and
+            abs(opt_res.optimal_kero_share - 0.15) < 0.01
         )
 
-        scenarios = self.opt_agent.generate_scenarios(telemetry, qr, rr)
-
-        # Режим полностью идеален
-        if not scenarios and blend_result['flash_point'] >= self.spec.MIN_FLASH_POINT_C and rr.is_safe:
+        if has_no_actions and qr.risk_level == "NORMAL" and rr.is_safe:
             return {
                 "timestamp": timestamp,
                 "status": "NORMAL_OPERATION",
                 "verdict": "ШТАТНЫЙ_РЕЖИМ",
-                "message": "Технологический процесс оптимален. Корректировка не требуется.",
+                "message": "Технологический процесс оптимален. Вмешательство регуляторов не требуется.",
+                "explanation_for_operator": "Параметры находятся в устойчивом технологическом коридоре. Система не создает лишних управляющих действий.",
                 "metrics": {
-                    "ГОДТ сера": f"{godt_s:.2f} мг/кг ({qr.source})",
-                    "Товарный дизель сера": f"{blend_result['sulfur']:.2f} мг/кг",
-                    "Товарный дизель ЦЧ": blend_result['cetane'],
-                    "Вспышка смеси": f"{blend_result['flash_point']:.1f} °C",
+                    "ГОДТ сера": f"{qr.active_sulfur:.2f} мг/кг ({qr.source})",
+                    "Товарный дизель сера": f"{current_blend_s:.2f} мг/кг",
+                    "Товарный дизель ЦЧ": 51.0,
+                    "Вспышка смеси": f"{current_blend_fl:.1f} °C",
                     "Перепад Р-202": f"{rr.dp_reactor_p8:.2f} МПа (норма)"
                 }
             }
 
-        # Приоритет: Аварии оборудования (dP) > Качество (Вспышка/Сера) > Экономика
-        best_action = sorted(scenarios, key=lambda a: a.total_cost_rub_h)[0]
-
-        # Расчет ПРОГНОЗНЫХ параметров ПОСЛЕ применения действия
-        pred_s = godt_s
-        pred_flash = qr.flash_point
-        pred_dp = rr.dp_reactor_p8
         status = "ACTION_RECOMMENDED"
 
-        if best_action.issue_type == 'EQUIPMENT_DP':
-            status = "EQUIPMENT_OVERLOAD"
-            # Прогноз снижения перепада после разгрузки сырья
-            curr_feed = best_action.current_value
-            new_feed = best_action.recommended_value
-            pred_dp = round(rr.dp_reactor_p8 * (new_feed / curr_feed)**2, 2)
+        actions_list = []
+        if abs(opt_res.delta_f9) >= 1.0:
+            actions_list.append({
+                "unit_name": "Гидроочистка 24-2000 (Сырьевой насос)",
+                "parameter": "F9 (Расход сырья на установку, массовый)",
+                "current": state_dict['F9'],
+                "target": opt_res.optimal_f9,
+                "delta": f"{opt_res.delta_f9:+.1f} т/ч",
+                "unit_of_measure": "т/ч"
+            })
 
-            explanation = best_action.explanation
-            if blend_result['flash_point'] < self.spec.MIN_FLASH_POINT_C:
-                explanation += f" ВНИМАНИЕ: Также зафиксирована низкая вспышка смеси ({blend_result['flash_point']:.1f} °C)! Требуется коррекция отпарки в К-201."
+        if abs(opt_res.delta_t6) >= 0.3:
+            actions_list.append({
+                "unit_name": "Гидроочистка 24-2000 (Печь нагрева ГСС)",
+                "parameter": "T6 (Температура входа в реактор Р-202)",
+                "current": state_dict['T6'],
+                "target": opt_res.optimal_t6,
+                "delta": f"{opt_res.delta_t6:+.1f} °C",
+                "unit_of_measure": "°C"
+            })
 
-        elif best_action.issue_type == 'FLASH_POINT':
-            expected_flash_gain = (best_action.delta / 0.010) * 2.5
-            pred_flash = round(qr.flash_point + expected_flash_gain, 1)
-            pred_blend_flash = round(0.85 * pred_flash + 0.15 * 48.0, 1)
+        if abs(opt_res.delta_w7) >= 0.005:
+            actions_list.append({
+                "unit_name": "Блок стабилизации (Отпарная колонна К-201)",
+                "parameter": "W7 (Расход газа поддува в колонну К-201)",
+                "current": state_dict['W7'],
+                "target": opt_res.optimal_w7,
+                "delta": f"{opt_res.delta_w7:+.3f} т/ч",
+                "unit_of_measure": "т/ч"
+            })
 
-            if pred_blend_flash >= self.spec.MIN_FLASH_POINT_C:
-                explanation = (
-                    f"{best_action.explanation} Прогнозная вспышка смеси: ~{pred_blend_flash:.1f} °C "
-                    f"(норма ГОСТ >= {self.spec.MIN_FLASH_POINT_C} °C будет выполнена)."
-                )
+        if abs(opt_res.optimal_kero_share - 0.15) >= 0.02:
+            actions_list.append({
+                "unit_name": "Резервуарный парк (Блендинг)",
+                "parameter": "Доля керосина в смеси",
+                "current": 0.15,
+                "target": opt_res.optimal_kero_share,
+                "delta": f"{(opt_res.optimal_kero_share - 0.15)*100:+.0f}%",
+                "unit_of_measure": "доля"
+            })
+
+        main_action = actions_list[0] if actions_list else {
+            "unit_name": "Технологический режим",
+            "parameter": "Режим стабилен",
+            "current": 0.0,
+            "target": 0.0,
+            "delta": "0.0",
+            "unit_of_measure": ""
+        }
+
+        # ЧЕТКОЕ И ПОНЯТНОЕ ОБЪЯСНЕНИЕ (РАЗДЕЛЯЕМ ГОДТ И ТОВАРНУЮ СМЕСЬ)
+        reasons = []
+        if abs(opt_res.delta_f9) >= 1.0:
+            reasons.append(f"Снижение подачи сырья F9 на {opt_res.delta_f9:+.1f} т/ч снизит перепад dP до нормы {opt_res.predicted_dp:.2f} МПа (норма <= 0.80 МПа).")
+
+        if abs(opt_res.delta_t6) >= 0.3:
+            if opt_res.delta_t6 < 0:
+                reasons.append(f"Снижение нагрева печи T6 на {opt_res.delta_t6:+.1f} °C экономит топливо (сера ГОДТ: {opt_res.predicted_godt_sulfur:.2f} мг/кг).")
             else:
-                explanation = (
-                    f"{best_action.explanation} Прогнозная вспышка смеси: ~{pred_blend_flash:.1f} °C. "
-                    "Рекомендуется также снизить долю керосина в блендинге с 15% до 10%!"
+                # ПРОЗРАЧНО ОБЪЯСНЯЕМ И ГОДТ, И СМЕСЬ В РЕЗЕРВУАРЕ:
+                reasons.append(
+                    f"Подъем температуры печи T6 на {opt_res.delta_t6:+.1f} °C снизит серу компонента ГОДТ до {opt_res.predicted_godt_sulfur:.2f} мг/кг. "
+                    f"С учетом блендинга прогнозная сера товарного дизеля в резервуаре составит {opt_res.predicted_blend_sulfur:.2f} мг/кг (норма ГОСТ <= 10.0 выполнена)."
                 )
 
-        elif best_action.issue_type == 'SULFUR':
-            expected_s_drop = best_action.delta * 0.3
-            pred_s = max(godt_s - expected_s_drop, 0.0)
-            if pred_s <= 10.0:
-                explanation = f"{best_action.explanation} Прогнозная сера смеси: ~{pred_s:.2f} мг/кг (норма выполнена)."
-            else:
-                status = "CRITICAL_OFF_SPEC"
-                explanation = (
-                    f"ВНИМАНИЕ! Глубокий выброс серы ({godt_s:.2f} мг/кг). Шага печи недостаточно. "
-                    "Требуется аварийный перевод потока в некондицию!"
-                )
+        if abs(opt_res.delta_w7) >= 0.005:
+            reasons.append(f"Коррекция отпарки W7 на {opt_res.delta_w7:+.3f} т/ч гарантирует вспышку смеси {opt_res.predicted_blend_flash:.1f} °C (ГОСТ >= 55.0 °C).")
 
-        elif best_action.issue_type == 'OPTIMIZATION_THROUGHPUT':
-            status = "OPTIMIZATION_OPPORTUNITY"
-            explanation = best_action.explanation
+        if abs(opt_res.optimal_kero_share - 0.15) >= 0.02:
+            reasons.append(f"Корректировка доли керосина до {opt_res.optimal_kero_share*100:.0f}% обеспечивает дополнительный запас по качеству.")
 
-        pred_blend = BlendingEngine.blend(
-            c_hydro=BlendComponent("ГОДТ", 0.85, pred_s, 836.0, 52.0, pred_flash, 348.0, -16.0),
-            c_kero=BlendComponent("Керосин", 0.15, 3.0, 795.0, 44.0, 48.0, 245.0, -48.0),
-            c_gasoil=BlendComponent("Газойль", 0.00, 28.0, 865.0, 48.0, 75.0, 362.0, -4.0),
-            dose_cetane_booster_kg_t=0.1,
-            dose_depressant_kg_t=0.0
-        )
-
-        is_sulfur_ok = pred_blend['sulfur'] <= self.spec.MAX_SULFUR_MG_KG
-        is_flash_ok = pred_blend['flash_point'] >= self.spec.MIN_FLASH_POINT_C
-        is_dp_ok = pred_dp <= self.limits.MAX_REACTOR_DP_MPA
-
-        delta_fmt = f"{best_action.delta:+.3f}" if abs(best_action.delta) < 1.0 else f"{best_action.delta:+.1f}"
+        expl_string = " ".join(reasons) if reasons else "Режим скорректирован до нормы."
 
         return {
             "timestamp": timestamp,
             "status": status,
             "detected_risk": qr.issues + rr.alerts,
             "recommended_action": {
-                "unit_name": best_action.target_unit,
-                "parameter": best_action.parameter,
-                "current": best_action.current_value,
-                "target": best_action.recommended_value,
-                "delta": f"{delta_fmt} {best_action.unit_of_measure}",
-                "unit_of_measure": best_action.unit_of_measure,
-                "estimated_cost": f"{best_action.total_cost_rub_h:+.0f} руб/ч"
+                **main_action,
+                "estimated_cost": f"{opt_res.net_economic_effect_rub_h:+.0f} руб/ч (нетто-эффект)",
+                "all_actions": actions_list
             },
-            "blend_quality_forecast": pred_blend,
+            "blend_quality_forecast": {
+                "sulfur": opt_res.predicted_blend_sulfur,
+                "flash_point": opt_res.predicted_blend_flash,
+                "cetane": opt_res.predicted_blend_cetane,
+                "density": 830.0
+            },
             "constraints_verified": [
-                ("Сера смеси <= 10 мг/кг", is_sulfur_ok),
-                (f"Вспышка смеси >= {self.spec.MIN_FLASH_POINT_C} °C", is_flash_ok),
-                ("Цетановое число >= 51", pred_blend['cetane'] >= self.spec.MIN_CETANE_NUMBER),
-                (f"Перепад Р-202 <= 0.8 МПа (прогноз {pred_dp:.2f} МПа)", is_dp_ok),
+                (f"Сера смеси <= 10 мг/кг (прогноз {opt_res.predicted_blend_sulfur:.2f})", opt_res.predicted_blend_sulfur <= self.spec.MAX_SULFUR_MG_KG),
+                (f"Вспышка смеси >= 55.0 °C (прогноз {opt_res.predicted_blend_flash:.1f} °C)", opt_res.predicted_blend_flash >= self.spec.MIN_FLASH_POINT_C),
+                (f"Цетановое число >= 51 (прогноз {opt_res.predicted_blend_cetane:.1f})", opt_res.predicted_blend_cetane >= self.spec.MIN_CETANE_NUMBER),
+                (f"Перепад Р-202 <= 0.8 МПа (прогноз {opt_res.predicted_dp:.2f} МПа)", opt_res.predicted_dp <= self.limits.MAX_REACTOR_DP_MPA),
                 ("Баланс компонентов блендинга = 100%", True)
             ],
-            "explanation_for_operator": explanation
+            "explanation_for_operator": expl_string
         }

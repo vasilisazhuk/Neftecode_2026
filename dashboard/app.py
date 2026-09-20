@@ -4,7 +4,6 @@
 import sys
 from pathlib import Path
 
-# Гарантируем видимость модулей проекта в Python
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -35,7 +34,7 @@ orchestrator = st.session_state.orchestrator
 
 
 # 2. Кэшированная загрузка реального датасета
-@st.cache_data(show_spinner="Загрузка и синхронизация архива телеметрии (189 000 строк)...")
+@st.cache_data(show_spinner="Загрузка архива телеметрии (189 000 строк)...")
 def load_cached_history():
     try:
         return build_full_dataset()
@@ -44,14 +43,14 @@ def load_cached_history():
         return None
 
 
-# 3. Боковая панель: выбор источника данных
+# 3. Боковая панель
 st.sidebar.header("🕹️ Режим работы дашборда")
 data_mode = st.sidebar.radio(
     "Источник данных:",
     [
+        "Ручной ввод установок",
         "Реальный архив телеметрии (из resources/)",
-        "Демо-сценарии (быстрый показ)",
-        "Ручной ввод установок"
+        "Демо-сценарии (быстрый показ)"
     ]
 )
 
@@ -59,7 +58,33 @@ row = None
 history_df = None
 point_idx = 0
 
-if data_mode == "Реальный архив телеметрии (из resources/)":
+if data_mode == "Ручной ввод установок":
+    st.sidebar.subheader("📊 Показатели процесса (CV / DV):")
+    # ИДЕАЛЬНЫЕ ШТАТНЫЕ УСТАВКИ ПО УМОЛЧАНИЮ
+    q21_in = st.sidebar.number_input("Сера ГОДТ Q21 (мг/кг)", value=7.20, step=0.10)
+    p8_in = st.sidebar.number_input("Перепад dP Р-202 P8 (МПа)", value=0.22, step=0.05)
+    flash_in = st.sidebar.number_input("Температура вспышки T18 (°C)", value=62.0, step=1.0)
+
+    st.sidebar.subheader("🎛️ Управляемые переменные (MV):")
+    t6_in = st.sidebar.number_input("Температура входа Р-202 T6 (°C)", value=358.0, step=0.5)
+    f9_in = st.sidebar.number_input("Расход сырья ГОДТ F9 (т/ч)", value=170.0, step=5.0)
+    w7_in = st.sidebar.number_input("Газ отпарки К-201 W7 (т/ч)", value=0.140, step=0.010, format="%.3f")
+
+    # Идеальный срез для ручного режима
+    row = pd.Series({
+        'date': '2026-08-04 12:00:00',
+        'Q21': q21_in,
+        'P8': p8_in,
+        'T6': t6_in,
+        'T11': t6_in + 14.0,
+        'T18': flash_in,
+        'F9': f9_in,
+        'W7': w7_in,
+        'LIMS_Гидроочистка.. Точка отбора 2. Продукт Дизельное топливо_Mg.Sulfur': q21_in,
+        'LIMS_Гидроочистка.. Точка отбора 2. Продукт Дизельное топливо_Mg.Sulfur__age_h': 4.0
+    })
+
+elif data_mode == "Реальный архив телеметрии (из resources/)":
     history_df = load_cached_history()
 
     if history_df is None or history_df.empty:
@@ -78,7 +103,7 @@ if data_mode == "Реальный архив телеметрии (из resource
         row = history_df.iloc[point_idx]
         st.sidebar.info(f"Выбрана дата: **{row['date']}**")
 
-if data_mode == "Демо-сценарии (быстрый показ)":
+elif data_mode == "Демо-сценарии (быстрый показ)":
     scenario = st.sidebar.selectbox(
         "Выберите ситуацию:",
         [
@@ -96,7 +121,7 @@ if data_mode == "Демо-сценарии (быстрый показ)":
             'T11': 371.0,
             'T18': 62.0,
             'F9': 170.0,
-            'W7': 0.14
+            'W7': 0.140
         })
     elif scenario == "Сценарий 2: Риск серы (9.4 мг/кг) и вспышки":
         row = pd.Series({
@@ -107,7 +132,7 @@ if data_mode == "Демо-сценарии (быстрый показ)":
             'T11': 372.0,
             'T18': 52.0,
             'F9': 170.0,
-            'W7': 0.14
+            'W7': 0.140
         })
     elif scenario == "Сценарий 3: Сбой датчика Q21 и устаревание ЛИМС":
         row = pd.Series({
@@ -119,32 +144,9 @@ if data_mode == "Демо-сценарии (быстрый показ)":
             'T11': 374.0,
             'T18': 60.0,
             'F9': 170.0,
-            'W7': 0.14
+            'W7': 0.140
         })
 
-elif data_mode == "Ручной ввод установок":
-    st.sidebar.subheader("📊 Показатели процесса (CV / DV):")
-    q21_in = st.sidebar.number_input("Сера ГОДТ Q21 (мг/кг)", value=8.30, step=0.10)
-    p8_in = st.sidebar.number_input("Перепад dP Р-202 P8 (МПа)", value=0.90, step=0.05)
-    flash_in = st.sidebar.number_input("Температура вспышки T18 (°C)", value=56.0, step=1.0)
-
-    st.sidebar.subheader("🎛️ Управляемые переменные (MV):")
-    t6_in = st.sidebar.number_input("Температура входа Р-202 T6 (°C)", value=350.5, step=0.5)
-    f9_in = st.sidebar.number_input("Расход сырья ГОДТ F9 (т/ч)", value=170.0, step=5.0)
-    w7_in = st.sidebar.number_input("Газ отпарки К-201 W7 (т/ч)", value=0.140, step=0.010, format="%.3f")
-
-    row = pd.Series({
-        'date': '2026-08-04 12:00:00',
-        'Q21': q21_in,
-        'P8': p8_in,
-        'T6': t6_in,
-        'T11': t6_in + 14.0,
-        'T18': flash_in,
-        'F9': f9_in,
-        'W7': w7_in
-    })
-
-# 4. Прогон состояния через агентов
 decision = orchestrator.process_step(row)
 qa_eval = orchestrator.quality_agent.evaluate(row)
 
@@ -154,7 +156,7 @@ s_source = qa_eval.source
 # =====================================================================
 # ВЕРХНИЙ БЛОК: КАРТОЧКИ KPI
 # =====================================================================
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 
 with col1:
     if pd.notna(current_s):
@@ -172,7 +174,7 @@ with col2:
     p8_val = row.get('P8', np.nan)
     p8_val = float(p8_val) if pd.notna(p8_val) else 0.0
     st.metric(
-        label="Перепад dP Р-202 (P8)",
+        label="Перепад dP Р-202",
         value=f"{p8_val:.2f} МПа",
         delta="Норма (<= 0.8 МПа)" if p8_val <= 0.8 else "КРИТИЧЕСКИЙ ПЕРЕПАД",
         delta_color="normal" if p8_val <= 0.8 else "inverse"
@@ -182,7 +184,7 @@ with col3:
     flash_val = row.get('T18', np.nan)
     flash_val = float(flash_val) if pd.notna(flash_val) else qa_eval.flash_point
     st.metric(
-        label="Вспышка ГОДТ (T18)",
+        label="Вспышка ГОДТ",
         value=f"{flash_val:.1f} °C",
         delta="Норма (>= 55 °C)" if flash_val >= 55.0 else "НИЖЕ ГОСТ",
         delta_color="normal" if flash_val >= 55.0 else "inverse"
@@ -191,13 +193,20 @@ with col3:
 with col4:
     t6_val = row.get('T6', np.nan)
     t6_val = float(t6_val) if pd.notna(t6_val) else 0.0
-    st.metric(
-        label="Температура входа Р-202 (T6)",
-        value=f"{t6_val:.1f} °C" if t6_val > 0 else "НЕТ ДАННЫХ"
-    )
+    st.metric(label="Печь T6", value=f"{t6_val:.1f} °C" if t6_val > 0 else "НЕТ ДАННЫХ")
+
+with col5:
+    f9_val = row.get('F9', np.nan)
+    f9_val = float(f9_val) if pd.notna(f9_val) else 170.0
+    st.metric(label="Сырье F9", value=f"{f9_val:.1f} т/ч")
+
+with col6:
+    w7_val = row.get('W7', np.nan)
+    w7_val = float(w7_val) if pd.notna(w7_val) else 0.140
+    st.metric(label="Газ W7", value=f"{w7_val:.3f} т/ч")
 
 # =====================================================================
-# БЛОК ГРАФИКА ТРЕНДА
+# ГРАФИК ТРЕНДА (ТОЧКА СТРОГО НА СИНЕЙ ЛИНИИ)
 # =====================================================================
 if history_df is not None and ('Q21' in history_df.columns or 'PAK_Sulfur' in history_df.columns):
     st.subheader("📈 Тренд серы (окно ±2 суток вокруг выбранной точки)")
@@ -212,7 +221,7 @@ if history_df is not None and ('Q21' in history_df.columns or 'PAK_Sulfur' in hi
         x=sub_df['date'],
         y=sub_df[sulfur_col],
         mode='lines',
-        name='Сера (мг/кг)',
+        name='Сера КИП (мг/кг)',
         line=dict(color='#1f77b4', width=2)
     ))
     fig.add_hline(
@@ -221,17 +230,20 @@ if history_df is not None and ('Q21' in history_df.columns or 'PAK_Sulfur' in hi
         line_color="red",
         annotation_text="Лимит ГОСТ (10 мг/кг)"
     )
-    if pd.notna(current_s):
+
+    # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: берем ровно то значение, которое нарисовано на синей линии!
+    curve_point_val = row.get(sulfur_col, np.nan)
+    if pd.notna(curve_point_val):
         fig.add_trace(go.Scatter(
             x=[row['date']],
-            y=[current_s],
+            y=[curve_point_val],
             mode='markers',
-            marker=dict(size=12, color='gold', symbol='diamond'),
-            name='Текущая точка'
+            marker=dict(size=12, color='gold', symbol='diamond', line=dict(width=2, color='black')),
+            name=f'Текущая точка КИП ({curve_point_val:.2f} мг/кг)'
         ))
 
     fig.update_layout(
-        height=280,
+        height=260,
         margin=dict(l=20, r=20, t=30, b=20),
         legend=dict(orientation="h", y=1.1)
     )
@@ -240,13 +252,13 @@ if history_df is not None and ('Q21' in history_df.columns or 'PAK_Sulfur' in hi
 st.divider()
 
 # =====================================================================
-# РЕШЕНИЕ ОРКЕСТРАТОРА
+# РЕШЕНИЕ ОРКЕСТРАТОРА (СТРОГО ПО ТЗ)
 # =====================================================================
 st.subheader("📋 Решение мультиагентной системы (МАС)")
 status = decision.get("status")
 
 if status == "NORMAL_OPERATION":
-    st.success("✅ **ШТАТНЫЙ РЕЖИМ:** Процесс стабилен. Вмешательство не требуется.")
+    st.success("✅ **ШТАТНЫЙ РЕЖИМ:** Процесс оптимален. Вмешательство регуляторов не требуется.")
     st.write(decision["message"])
 
 elif status == "REFUSAL_TO_RECOMMEND":
@@ -256,34 +268,44 @@ elif status == "REFUSAL_TO_RECOMMEND":
 
 elif status == "EQUIPMENT_OVERLOAD":
     st.error("🛑 **АВАРИЙНЫЙ РЕЖИМ ОБОРУДОВАНИЯ: СРОЧНАЯ РАЗГРУЗКА РЕАКТОРА!**")
+    st.warning(decision.get("reason", ""))
 
 elif status == "CRITICAL_OFF_SPEC":
-    st.error("🚨 **КРИТИЧЕСКИЙ ВЫБРОС СЕРЫ: СТАНДАРТНЫХ РЕГУЛИРОВОК НЕДОСТАТОЧНО!**")
+    st.error("🚨 **КРИТИЧЕСКИЙ ВЫБРОС / БРАК ПО КАЧЕСТВУ: ВЫХОД ЗА ПРЕДЕЛЫ ГОСТ!**")
+    st.warning(decision.get("reason", ""))
+
+elif status == "ENERGY_OPTIMIZATION":
+    st.info("💡 **ЭНЕРГОСБЕРЕЖЕНИЕ: ОПТИМИЗАЦИЯ ТЕМПЕРАТУРЫ ПЕЧИ И БЛЕНДИНГА**")
 
 elif status == "OPTIMIZATION_OPPORTUNITY":
-    st.success("💰 **РЕЗЕРВ ЭФФЕКТИВНОСТИ: ВОЗМОЖНО УВЕЛИЧЕНИЕ ВЫРАБОТКИ**")
+    st.success("💰 **ЗОЛОТОЕ ОКНО: ВОЗМОЖНО УВЕЛИЧЕНИЕ ВЫРАБОТКИ**")
 
 elif status == "ACTION_RECOMMENDED":
-    st.warning("⚠️ **ТРЕБУЕТСЯ УПРАВЛЯЮЩЕЕ ВОЗДЕЙСТВИЕ ДЛЯ ПРЕДОТВРАЩЕНИЯ БРАКА**")
+    st.warning("⚠️ **ТРЕБУЕТСЯ УПРАВЛЯЮЩЕЕ ВОЗДЕЙСТВИЕ ДЛЯ ВЫВОДА В НОРМУ**")
 
-if status in ["ACTION_RECOMMENDED", "CRITICAL_OFF_SPEC", "EQUIPMENT_OVERLOAD", "OPTIMIZATION_OPPORTUNITY"]:
+if status in ["ACTION_RECOMMENDED", "EQUIPMENT_OVERLOAD", "OPTIMIZATION_OPPORTUNITY", "ENERGY_OPTIMIZATION"]:
     c_left, c_right = st.columns([1, 1])
 
     with c_left:
-        st.markdown("#### Рекомендуемое действие:")
+        st.markdown("#### Рекомендуемый пакет воздействий:")
         act = decision.get("recommended_action", {})
-        curr_v = act.get('current', 0.0)
-        targ_v = act.get('target', 0.0)
-        uom = act.get('unit_of_measure', '')  # ЧИСТАЯ ЕДИНИЦА ИЗМЕРЕНИЯ (°C или т/ч)
-        fmt = ".3f" if abs(curr_v) < 1.0 else ".1f"
+        all_acts = act.get('all_actions', [])
 
-        st.info(f"""
-        * **Аппарат:** {act.get('unit_name', '-')}
-        * **Параметр:** `{act.get('parameter', '-')}`
-        * **Текущее значение:** `{curr_v:{fmt}} {uom}`
-        * **Рекомендуемое значение:** **`{targ_v:{fmt}} {uom}`** ({act.get('delta', '-')})
-        * **Экономический эффект / затраты:** `{act.get('estimated_cost', '-')}`
-        """)
+        if all_acts:
+            for a in all_acts:
+                curr_v = a.get('current', 0.0)
+                targ_v = a.get('target', 0.0)
+                uom = a.get('unit_of_measure', '')
+                fmt = ".3f" if abs(curr_v) < 1.0 else ".1f"
+                st.write(f"• **{a.get('parameter', '-')}:** `{curr_v:{fmt}} {uom}` ➔ **`{targ_v:{fmt}} {uom}`** ({a.get('delta', '-')})")
+        else:
+            curr_v = act.get('current', 0.0)
+            targ_v = act.get('target', 0.0)
+            uom = act.get('unit_of_measure', '')
+            fmt = ".3f" if abs(curr_v) < 1.0 else ".1f"
+            st.write(f"• **{act.get('parameter', '-')}:** `{curr_v:{fmt}} {uom}` ➔ **`{targ_v:{fmt}} {uom}`** ({act.get('delta', '-')})")
+
+        st.caption(f"Оценка экономического эффекта: **{act.get('estimated_cost', '-')}**")
 
     with c_right:
         st.markdown("#### Прогноз выполнения жестких ограничений:")
@@ -298,12 +320,16 @@ if status in ["ACTION_RECOMMENDED", "CRITICAL_OFF_SPEC", "EQUIPMENT_OVERLOAD", "
                 st.write(f"• {item}")
 
     st.markdown("#### Объяснение логики решения оператору:")
+    expl_text = decision.get("explanation_for_operator", decision.get("reason", decision.get("message", "Режим требует контроля.")))
+
     if status in ["CRITICAL_OFF_SPEC", "EQUIPMENT_OVERLOAD"]:
-        st.error(decision["explanation_for_operator"])
+        st.error(expl_text)
+    elif status == "ENERGY_OPTIMIZATION":
+        st.info(expl_text)
     elif status == "OPTIMIZATION_OPPORTUNITY":
-        st.success(decision["explanation_for_operator"])
+        st.success(expl_text)
     else:
-        st.info(decision["explanation_for_operator"])
+        st.warning(expl_text)
 
 st.divider()
 
