@@ -3,19 +3,10 @@
 """
 Консолидация телеметрии и лабораторных анализов.
 
-Формирует два датасета:
-
-1) consolidated_full.csv
-   Все теги телеметрии, интерполированные по времени.
-   Для каждой метки времени, где нет прямого замера, значение берётся
-   как среднее между двумя ближайшими по времени метками телеметрии
-   (линейная интерполяция). Сохраняются ВСЕ строки, включая те,
-   где лабораторных замеров нет (LIMS-колонки = NaN).
-
-2) consolidated_lab.csv
-   То же, но остаются только строки, где есть хотя бы один
-   лабораторный замер в окне ±1 час от метки времени.
-   Лабораторные значения усредняются по всем пробам в окне.
+Формирует:
+  1) consolidated_full.csv — вся телеметрия (с интерполяцией) + LIMS
+     там, где есть проба в окне ±1ч. Строки не выбрасываются.
+  2) consolidated_lab.csv  — только строки с лабораторным замером серы.
 """
 
 from __future__ import annotations
@@ -25,9 +16,9 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-# ----------------------------------------------------------------------
+# ======================================================================
 # 0. КОНФИГ
-# ----------------------------------------------------------------------
+# ======================================================================
 SCRIPT_DIR   = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 DATA_DIR     = PROJECT_ROOT / "resources" / "Neftcode_2.0"
@@ -38,13 +29,10 @@ OUT_FULL       = DATA_DIR / "consolidated_full.csv"
 OUT_LAB        = DATA_DIR / "consolidated_lab.csv"
 
 LAB_SHEET = 0
-
-# Окно для поиска лабораторного замера вокруг метки времени
 LAB_MATCH_WINDOW_HOURS = 1.0
+TARGET_SULFUR_HINT = "Mass.Sulfur"   # или "Mg.Sulfur"
 
 SEP = ","
-
-TARGET_LAB_HINTS = ("Mass.Sulfur", "Mg.Sulfur")   # приоритетные цели
 
 USED_TAGS = [
     "F1","F2","P3","W4","T5","T6","W7","P8","P9","W10","T11","T12",
@@ -57,44 +45,6 @@ UNIT_MARKERS = (
     "мг/кг", "ppm", "ед.цет", "ед.цет.ч", "МПа", "нм3", "нм³",
     "м3/ч", "м³/ч", "т/ч",
 )
-
-
-# ----------------------------------------------------------------------
-# 1. ТЕЛЕМЕТРИЯ
-# ----------------------------------------------------------------------
-def load_telemetry(path: Path) -> pd.DataFrame:
-    """
-    Читает телеметрию, приводит время к datetime, оставляет
-    только USED_TAGS. Никаких dropna — null-значения сохраняются.
-    """
-    df = pd.read_csv(path, sep=SEP, encoding="utf-8")
-    df.columns = [str(c).strip() for c in df.columns]
-
-    time_col = None
-    for c in df.columns:
-        if c.lower() in ("timestamp", "time", "datetime", "дата", "время"):
-            time_col = c
-            break
-    if time_col is None:
-        time_col = df.columns[0]
-
-    df = df.rename(columns={time_col: "timestamp"})
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce",
-                                     dayfirst=True)
-    df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
-
-    for c in df.columns:
-        if c != "timestamp":
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    keep = ["timestamp"] + [t for t in USED_TAGS if t in df.columns]
-    df = df[keep].reset_index(drop=True)
-    return df
-
-
-# ----------------------------------------------------------------------
-# 2. ЛАБОРАТОРИЯ
-# ----------------------------------------------------------------------
 
 RU_MONTHS = {
     "янв": 1,  "январь": 1,  "января": 1,
@@ -112,82 +62,132 @@ RU_MONTHS = {
 }
 
 _RU_MONTH_RE = re.compile(
-    r"(\d{1,2})[-\.\s]+([А-Яа-яЁё]+)[-\.\s]+(\d{2,4})"
-    r"(?:[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?"
+    r"^\s*(\d{1,2})[-\.\s\/]+([А-Яа-яЁё]+)[-\.\s\/]+(\d{2,4})"
+    r"(?:[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*$"
 )
 
 
-def _parse_lab_time(series: pd.Series) -> pd.Series:
-    """Парсит колонку времени из Excel в pd.Timestamp.
-    Поддерживает:
-      - '21-янв-26 10:00:00' (русские месяцы)
-      - '2023-01-21 10:00:00' (ISO)
-      - '21.01.2023 10:00' (числовой)
-      - Excel serial date (числа 20000..60000)
-      - unix-время (числа > 1e8)
-      - datetime64
-    """
-    s = series.copy()
+# ======================================================================
+# 1. УНИВЕРСАЛЬНЫЙ ПАРСЕР ДАТ
+# ======================================================================
+def _parse_one_date(v) -> pd.Timestamp:
+    """Парсит одну ячейку в pd.Timestamp. Возвращает pd.NaT, если не удалось."""
+    if v is None:
+        return pd.NaT
+    if isinstance(v, pd.Timestamp):
+        return v
+    if hasattr(v, "year") and hasattr(v, "month"):   # datetime/date
+        return pd.Timestamp(v)
 
-    if pd.api.types.is_datetime64_any_dtype(s):
-        return s
-
-    # --- числа: excel serial / unix ---
-    if pd.api.types.is_numeric_dtype(s):
-        num = pd.to_numeric(s, errors="coerce")
-        med = num.dropna().median() if num.notna().any() else None
-        if med is not None:
-            if 20000 <= med <= 60000:
-                origin = pd.Timestamp("1899-12-30")
-                return origin + pd.to_timedelta(num, unit="D")
-            if 1e8  <= med < 1e11: return pd.to_datetime(num, unit="s",  errors="coerce")
-            if 1e11 <= med < 1e14: return pd.to_datetime(num, unit="ms", errors="coerce")
-            if 1e14 <= med < 1e17: return pd.to_datetime(num, unit="us", errors="coerce")
-            if med >= 1e17:        return pd.to_datetime(num, unit="ns", errors="coerce")
-        return pd.to_datetime(num, errors="coerce")
-
-    # --- строки ---
-    s_str = s.astype(str).str.strip()
-
-    # быстрый тест: пробуем стандартный парсер
-    fast = pd.to_datetime(s_str, errors="coerce", dayfirst=True)
-    if fast.notna().sum() >= 0.9 * s_str.notna().sum():
-        return fast
-
-    # --- русские месяцы ---
-    def parse_one(v: str):
-        if not isinstance(v, str) or v.strip() == "" or v.lower() == "nan":
+    # NaN
+    try:
+        if pd.isna(v):
             return pd.NaT
+    except (TypeError, ValueError):
+        pass
 
-        m = _RU_MONTH_RE.search(v.strip().lower())
-        if not m:
-            # не подошло — отдаём pandas
-            try:
-                return pd.to_datetime(v, errors="raise", dayfirst=True)
-            except Exception:
-                return pd.NaT
+    # числа: excel serial или unix
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        f = float(v)
+        # excel serial date (дни от 1899-12-30)
+        if 20000 <= f <= 60000:
+            return pd.Timestamp("1899-12-30") + pd.to_timedelta(f, unit="D")
+        # unix
+        if 1e8 <= f < 1e11:
+            return pd.Timestamp(f, unit="s")
+        if 1e11 <= f < 1e14:
+            return pd.Timestamp(f, unit="ms")
+        if 1e14 <= f < 1e17:
+            return pd.Timestamp(f, unit="us")
+        if f >= 1e17:
+            return pd.Timestamp(f, unit="ns")
+        return pd.NaT
 
-        day, mon_name, year = m.group(1), m.group(2), m.group(3)
-        mon = RU_MONTHS.get(mon_name[:3]) or RU_MONTHS.get(mon_name)
+    # строки
+    s = str(v).strip()
+    if s == "" or s.lower() in ("nan", "nat", "none"):
+        return pd.NaT
+
+    # русские месяцы: "15-янв-26 10:00:00"
+    m = _RU_MONTH_RE.match(s)
+    if m:
+        day, mon_name, year, hh, mm, ss = m.groups()
+        mon = RU_MONTHS.get(mon_name.lower()[:4]) or RU_MONTHS.get(mon_name.lower()[:3])
         if mon is None:
             return pd.NaT
-
-        # год: 2 цифры -> 20xx
-        year = int(year)
-        if year < 100:
-            year += 2000
-
-        hour   = int(m.group(4)) if m.group(4) else 0
-        minute = int(m.group(5)) if m.group(5) else 0
-        second = int(m.group(6)) if m.group(6) else 0
-
+        y = int(year)
+        if y < 100:
+            y += 2000 if y < 70 else 1900
         try:
-            return pd.Timestamp(year=year, month=mon, day=int(day),
-                                hour=hour, minute=minute, second=second)
+            return pd.Timestamp(year=y, month=mon, day=int(day),
+                                hour=int(hh) if hh else 0,
+                                minute=int(mm) if mm else 0,
+                                second=int(ss) if ss else 0)
         except ValueError:
             return pd.NaT
 
-    return s_str.map(parse_one)
+    # ISO и всё остальное — пробуем через pandas
+    try:
+        return pd.to_datetime(s, dayfirst=True)
+    except Exception:
+        pass
+    try:
+        return pd.to_datetime(s, dayfirst=False)
+    except Exception:
+        return pd.NaT
+
+
+def parse_time_column(series: pd.Series) -> pd.Series:
+    """Применяет _parse_one_date к каждой ячейке."""
+    return series.map(_parse_one_date)
+
+
+# ======================================================================
+# 2. ТЕЛЕМЕТРИЯ
+# ======================================================================
+def load_telemetry(path: Path) -> pd.DataFrame:
+    # utf-8-sig — убирает BOM в имени первой колонки
+    df = pd.read_csv(path, sep=SEP, encoding="utf-8-sig")
+    df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
+
+    time_col = None
+    for c in df.columns:
+        if c.lower() in ("timestamp", "time", "datetime", "дата", "время"):
+            time_col = c
+            break
+    if time_col is None:
+        time_col = df.columns[0]
+
+    df = df.rename(columns={time_col: "timestamp"})
+    df["timestamp"] = parse_time_column(df["timestamp"])
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
+
+    for c in df.columns:
+        if c != "timestamp":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    keep = ["timestamp"] + [t for t in USED_TAGS if t in df.columns]
+    return df[keep].reset_index(drop=True)
+
+
+# ======================================================================
+# 3. ЛАБОРАТОРИЯ (Excel)
+# ======================================================================
+def _forward_fill_merged(row: list) -> list:
+    out, last = [], None
+    for v in row:
+        if pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
+            out.append(last)
+        else:
+            last = v
+            out.append(v)
+    return out
+
+
+def _looks_like_units_row(row) -> bool:
+    return any(isinstance(v, str) and any(m in v for m in UNIT_MARKERS)
+               for v in row)
+
 
 def _is_readable_tag(s) -> bool:
     if not isinstance(s, str):
@@ -213,45 +213,10 @@ def _normalize_lab_name(name: str) -> str:
     return name if name.startswith("LIMS.") else f"LIMS.{name}"
 
 
-def _forward_fill_merged(row: list) -> list:
-    out, last = [], None
-    for v in row:
-        if pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
-            out.append(last)
-        else:
-            last = v
-            out.append(v)
-    return out
-
-
-def _looks_like_units_row(row) -> bool:
-    return any(
-        isinstance(v, str) and any(m in v for m in UNIT_MARKERS)
-        for v in row
-    )
-
-
-def _is_datetime_value(v) -> bool:
-    if pd.isna(v):
-        return False
-    if isinstance(v, (pd.Timestamp,)) or hasattr(v, "year"):
-        return True
-    if isinstance(v, str):
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
-                    "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
-                    "%Y-%m-%d", "%d.%m.%Y"):
-            try:
-                pd.to_datetime(v.strip(), format=fmt)
-                return True
-            except (ValueError, TypeError):
-                continue
-    if isinstance(v, (int, float)) and 20000 < v < 60000:
-        return True   # excel serial date
-    return False
-
-
 def _find_header_rows(raw: pd.DataFrame) -> dict:
-    n = min(20, len(raw))
+    """Ищет строку единиц измерения и первую строку с датой."""
+    n = min(30, len(raw))
+
     unit_row = None
     for i in range(n):
         if _looks_like_units_row(raw.iloc[i].tolist()):
@@ -260,16 +225,22 @@ def _find_header_rows(raw: pd.DataFrame) -> dict:
     if unit_row is None:
         raise ValueError(
             "Не нашёл строку с единицами измерения (°С, кг/м3, ...). "
-            "Проверьте первые 20 строк файла."
+            "Проверьте первые 30 строк файла."
         )
 
     param_row = max(unit_row - 1, 0)
 
+    # ищем первую строку, где хотя бы в одной из первых 5 колонок дата
     data_row = None
     for i in range(unit_row + 1, len(raw)):
-        if _is_datetime_value(raw.iat[i, 0]):
-            data_row = i
+        for col in range(min(5, raw.shape[1])):
+            ts = _parse_one_date(raw.iat[i, col])
+            if pd.notna(ts):
+                data_row = i
+                break
+        if data_row is not None:
             break
+
     if data_row is None:
         raise ValueError("Не нашёл первую строку с датой.")
 
@@ -281,10 +252,21 @@ def _find_header_rows(raw: pd.DataFrame) -> dict:
     }
 
 
+def _detect_time_column(data: pd.DataFrame) -> int:
+    """Возвращает индекс колонки, где больше всего дат."""
+    best_idx, best_cnt = 0, -1
+    for i in range(min(5, data.shape[1])):
+        parsed = data.iloc[:, i].map(_parse_one_date)
+        cnt = parsed.notna().sum()
+        if cnt > best_cnt:
+            best_idx, best_cnt = i, cnt
+    return best_idx
+
+
 def _build_column_names(param_values, group_values):
-    names = {0: "timestamp"}
+    names = {}
     used = set()
-    for i in range(1, len(param_values)):
+    for i in range(len(param_values)):
         base = _normalize_lab_name(param_values[i])
         if base == "":
             base = f"LIMS.col{i}"
@@ -313,19 +295,50 @@ def _read_one_sheet(path: Path, sheet) -> pd.DataFrame:
           f"unit_row={info['unit_row']}, data_row={info['data_row']}, "
           f"skipped={info['skipped_rows']}")
 
+    # параметры и группы (строка 0 — объединённая шапка)
     param_values = _forward_fill_merged(raw.iloc[info["param_row"]].tolist())
     group_values = _forward_fill_merged(raw.iloc[0].tolist())
 
     data = raw.iloc[info["data_row"]:].reset_index(drop=True)
     data.columns = range(data.shape[1])
 
-    data = data.rename(columns={0: "timestamp"})
-    #data["timestamp"] = pd.to_datetime(data["timestamp"], errors="coerce",
-    #                                   dayfirst=True)
-    data["timestamp"] = _parse_lab_time(data["timestamp"])
+    # --- определяем колонку времени автоматически ---
+    time_idx = _detect_time_column(data)
+    print(f"[sheet={sheet!r}] time column index = {time_idx}")
+
+    data = data.rename(columns={time_idx: "timestamp"})
+    data["timestamp"] = parse_time_column(data["timestamp"])
     data = data.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-    data = data.rename(columns=_build_column_names(param_values, group_values))
+    # --- имена колонок (кроме time_idx) ---
+    # переиндексируем param_values так, чтобы индексы совпадали с data
+    param_by_col = {i: v for i, v in enumerate(param_values)}
+    group_by_col = {i: v for i, v in enumerate(group_values)}
+
+    new_names = {}
+    used = set()
+    for col in data.columns:
+        if col == "timestamp":
+            continue
+        base = _normalize_lab_name(param_by_col.get(col, ""))
+        if base == "":
+            base = f"LIMS.col{col}"
+
+        grp = group_by_col.get(col)
+        if _is_readable_tag(grp):
+            grp_tag = _clean_tag(grp)
+            if grp_tag:
+                base = f"{base}__{grp_tag}"
+
+        name = base
+        k = 0
+        while name in used:
+            k += 1
+            name = f"{base}_{k}"
+        used.add(name)
+        new_names[col] = name
+
+    data = data.rename(columns=new_names)
 
     lab_cols = [c for c in data.columns if c.startswith("LIMS.")]
     for c in lab_cols:
@@ -370,85 +383,51 @@ def load_lab(path: Path, sheet=LAB_SHEET) -> pd.DataFrame:
     return lab.sort_values("timestamp").reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------
-# 3. ИНТЕРПОЛЯЦИЯ ТЕЛЕМЕТРИИ ПО ВРЕМЕНИ
-# ----------------------------------------------------------------------
+# ======================================================================
+# 4. ИНТЕРПОЛЯЦИЯ ТЕЛЕМЕТРИИ
+# ======================================================================
 def interpolate_telemetry(tele: pd.DataFrame,
                           target_index: pd.DatetimeIndex) -> pd.DataFrame:
-    """
-    Приводит телеметрию к целевому индексу времени.
-
-    Для каждого момента времени target_index:
-      - если в tele есть точка с ровно таким же timestamp —
-        берётся её значение;
-      - иначе значение линейно интерполируется между двумя
-        ближайшими по времени точками телеметрии
-        (по умолчанию pandas.interpolate(method="time") делает
-        именно линейную интерполяцию по времени).
-
-    Никакие строки не выбрасываются — если целевая точка вне
-    диапазона tele, значения будут NaN (это ожидаемо).
-    """
     t = tele.set_index("timestamp").sort_index()
-    # приводим индекс к тому же типу
     target_index = pd.DatetimeIndex(target_index).sort_values()
 
-    # reindex по объединённому индексу, потом интерполируем по времени
     combined = t.reindex(t.index.union(target_index))
     combined = combined.interpolate(method="time", limit_direction="both")
 
-    # выбираем только целевые моменты
     out = combined.reindex(target_index)
     out.index.name = "timestamp"
     return out.reset_index()
 
 
-# ----------------------------------------------------------------------
-# 4. СОПОСТАВЛЕНИЕ ЛАБОРАТОРИИ С ТЕЛЕМЕТРИЕЙ
-# ----------------------------------------------------------------------
+# ======================================================================
+# 5. СОПОСТАВЛЕНИЕ LIMS ↔ ТЕЛЕМЕТРИЯ
+# ======================================================================
 def match_lab_to_telemetry(lab: pd.DataFrame,
                            tele: pd.DataFrame,
                            window_hours: float = LAB_MATCH_WINDOW_HOURS
                            ) -> pd.DataFrame:
-    """
-    Для каждой метки времени телеметрии ищет лабораторные пробы,
-    попавшие в окно ±window_hours. Если найдены — усредняет
-    LIMS-значения по окну. Если нет — все LIMS-колонки = NaN.
-    Возвращает DataFrame с колонкой timestamp и всеми LIMS-колонками.
-    """
     lab_cols = [c for c in lab.columns if c.startswith("LIMS.")]
     half = pd.Timedelta(hours=window_hours)
 
-    # заранее сортируем и кладём время в индекс для быстрого поиска
     lab_sorted = lab.sort_values("timestamp").reset_index(drop=True)
-    lab_times = lab_sorted["timestamp"].values
 
     rows = []
     for ts in tele["timestamp"]:
-        lo = ts - half
-        hi = ts + half
+        lo, hi = ts - half, ts + half
         mask = (lab_sorted["timestamp"] >= lo) & (lab_sorted["timestamp"] <= hi)
         sub = lab_sorted.loc[mask, lab_cols]
-        if sub.empty:
-            row = {c: np.nan for c in lab_cols}
-        else:
-            row = sub.mean(numeric_only=True).to_dict()
+        row = (sub.mean(numeric_only=True).to_dict()
+               if not sub.empty else {c: np.nan for c in lab_cols})
         row["timestamp"] = ts
         rows.append(row)
 
-    matched = pd.DataFrame(rows)[["timestamp"] + lab_cols]
-    return matched
+    return pd.DataFrame(rows)[["timestamp"] + lab_cols]
 
 
-# ----------------------------------------------------------------------
-# 5. СБОРКА ДВУХ ДАТАСЕТОВ
-# ----------------------------------------------------------------------
-def build_full_dataset(tele: pd.DataFrame,
-                       lab: pd.DataFrame) -> pd.DataFrame:
-    """
-    Датасет 1: телелеметрия интерполирована, LIMS присоединены
-    там, где они есть в окне ±1ч. Строки не выбрасываются.
-    """
+# ======================================================================
+# 6. СБОРКА ДАТАСЕТОВ
+# ======================================================================
+def build_full_dataset(tele: pd.DataFrame, lab: pd.DataFrame) -> pd.DataFrame:
     tele_interp = interpolate_telemetry(tele, tele["timestamp"])
     lab_matched = match_lab_to_telemetry(lab, tele_interp)
     out = pd.merge(tele_interp, lab_matched, on="timestamp", how="left")
@@ -456,54 +435,51 @@ def build_full_dataset(tele: pd.DataFrame,
 
 
 def build_lab_dataset(full: pd.DataFrame,
-                      lab_hint: str = "Mass.Sulfur") -> pd.DataFrame:
-    """
-    Датасет 2: то же, но оставляем только строки, где
-    есть хотя бы один лабораторный замер серы (по hint).
-    """
+                      lab_hint: str = TARGET_SULFUR_HINT) -> pd.DataFrame:
     sulfur_cols = [c for c in full.columns
                    if c.startswith("LIMS.") and lab_hint in c]
     if not sulfur_cols:
         raise KeyError(
-            f"Не нашёл ни одной LIMS-колонки с '{lab_hint}'. "
+            f"Не нашёл LIMS-колонок с '{lab_hint}'. "
             f"Доступные LIMS: "
             f"{[c for c in full.columns if c.startswith('LIMS.')]}"
         )
-
     has_lab = full[sulfur_cols].notna().any(axis=1)
-    out = full.loc[has_lab].reset_index(drop=True)
-    return out
+    return full.loc[has_lab].reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------
-# 6. MAIN
-# ----------------------------------------------------------------------
+# ======================================================================
+# 7. MAIN
+# ======================================================================
 def main():
     print("-> Чтение телеметрии...")
     tele = load_telemetry(TELEMETRY_FILE)
     print(f"   строк: {len(tele)}, колонок: {tele.shape[1]}")
     print(f"   период: {tele['timestamp'].min()} - {tele['timestamp'].max()}")
+    print(f"   NaT: {tele['timestamp'].isna().sum()}")
 
-    print("-> Чтение лаборатории из Excel...")
+    print("-> Чтение лаборатории...")
     lab = load_lab(LAB_FILE, sheet=LAB_SHEET)
     print(f"   проб: {len(lab)}, LIMS-параметров: {lab.shape[1] - 1}")
     print(f"   период: {lab['timestamp'].min()} - {lab['timestamp'].max()}")
+    print(f"   NaT: {lab['timestamp'].isna().sum()}")
+    print(f"   первые 5 дат: {lab['timestamp'].head().tolist()}")
 
-    print("-> Формирование полного датасета (телеметрия + интерполяция)...")
+    print("-> Полный датасет (телеметрия + интерполяция + LIMS)...")
     full = build_full_dataset(tele, lab)
     full.to_csv(OUT_FULL, index=False, encoding="utf-8-sig")
     print(f"   сохранено: {OUT_FULL} ({full.shape})")
+    print(f"   период: {full['timestamp'].min()} - {full['timestamp'].max()}")
 
-    print("-> Формирование датасета с лабораторными замерами...")
-    lab_ds = build_lab_dataset(full, lab_hint="Mass.Sulfur")
+    print("-> Датасет с лабораторными замерами серы...")
+    lab_ds = build_lab_dataset(full)
     lab_ds.to_csv(OUT_LAB, index=False, encoding="utf-8-sig")
     print(f"   сохранено: {OUT_LAB} ({lab_ds.shape})")
 
     sulfur_cols = [c for c in full.columns
                    if c.startswith("LIMS.") and "Sulfur" in c]
-    print(f"   колонки с серой: {sulfur_cols}")
     for c in sulfur_cols:
-        print(f"     {c}: notna = {full[c].notna().sum()}")
+        print(f"   {c}: notna = {full[c].notna().sum()}")
 
 
 if __name__ == "__main__":
