@@ -24,7 +24,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("⛽ Мультиагентная система управления качеством ДТ")
+st.title("Мультиагентная система управления качеством ДТ")
 st.caption("Сквозная цепочка: АВТ ➔ Гидроочистка 24-2000 ➔ Резервуарный блендинг ➔ ГОСТ 32511-2013 (К5)")
 
 # 1. Инициализация оркестратора
@@ -44,7 +44,7 @@ def load_cached_history():
 
 
 # 3. Боковая панель
-st.sidebar.header("🕹️ Режим работы дашборда")
+st.sidebar.header("Режим работы дашборда")
 data_mode = st.sidebar.radio(
     "Источник данных:",
     [
@@ -59,13 +59,13 @@ history_df = None
 point_idx = 0
 
 if data_mode == "Ручной ввод установок":
-    st.sidebar.subheader("📊 Показатели процесса (CV / DV):")
+    st.sidebar.subheader("Показатели процесса (CV / DV):")
     # ИДЕАЛЬНЫЕ ШТАТНЫЕ УСТАВКИ ПО УМОЛЧАНИЮ
     q21_in = st.sidebar.number_input("Сера ГОДТ Q21 (мг/кг)", value=7.20, step=0.10)
     p8_in = st.sidebar.number_input("Перепад dP Р-202 P8 (МПа)", value=0.22, step=0.05)
     flash_in = st.sidebar.number_input("Температура вспышки T18 (°C)", value=62.0, step=1.0)
 
-    st.sidebar.subheader("🎛️ Управляемые переменные (MV):")
+    st.sidebar.subheader("Управляемые переменные (MV):")
     t6_in = st.sidebar.number_input("Температура входа Р-202 T6 (°C)", value=358.0, step=0.5)
     f9_in = st.sidebar.number_input("Расход сырья ГОДТ F9 (т/ч)", value=170.0, step=5.0)
     w7_in = st.sidebar.number_input("Газ отпарки К-201 W7 (т/ч)", value=0.140, step=0.010, format="%.3f")
@@ -209,7 +209,7 @@ with col6:
 # ГРАФИК ТРЕНДА (ТОЧКА СТРОГО НА СИНЕЙ ЛИНИИ)
 # =====================================================================
 if history_df is not None and ('Q21' in history_df.columns or 'PAK_Sulfur' in history_df.columns):
-    st.subheader("📈 Тренд серы (окно ±2 суток вокруг выбранной точки)")
+    st.subheader("Тренд серы (окно ±2 суток вокруг выбранной точки)")
     window_start = max(0, point_idx - 144)
     window_end = min(len(history_df), point_idx + 144)
     sub_df = history_df.iloc[window_start:window_end]
@@ -254,11 +254,11 @@ st.divider()
 # =====================================================================
 # РЕШЕНИЕ ОРКЕСТРАТОРА (СТРОГО ПО ТЗ)
 # =====================================================================
-st.subheader("📋 Решение мультиагентной системы (МАС)")
+st.subheader("Решение мультиагентной системы (МАС)")
 status = decision.get("status")
 
 if status == "NORMAL_OPERATION":
-    st.success("✅ **ШТАТНЫЙ РЕЖИМ:** Процесс оптимален. Вмешательство регуляторов не требуется.")
+    st.success("**ШТАТНЫЙ РЕЖИМ:** Процесс оптимален. Вмешательство регуляторов не требуется.")
     st.write(decision["message"])
 
 elif status == "REFUSAL_TO_RECOMMEND":
@@ -271,17 +271,17 @@ elif status == "EQUIPMENT_OVERLOAD":
     st.warning(decision.get("reason", ""))
 
 elif status == "CRITICAL_OFF_SPEC":
-    st.error("🚨 **КРИТИЧЕСКИЙ ВЫБРОС / БРАК ПО КАЧЕСТВУ: ВЫХОД ЗА ПРЕДЕЛЫ ГОСТ!**")
+    st.error("**КРИТИЧЕСКИЙ ВЫБРОС / БРАК ПО КАЧЕСТВУ: ВЫХОД ЗА ПРЕДЕЛЫ ГОСТ!**")
     st.warning(decision.get("reason", ""))
 
 elif status == "ENERGY_OPTIMIZATION":
-    st.info("💡 **ЭНЕРГОСБЕРЕЖЕНИЕ: ОПТИМИЗАЦИЯ ТЕМПЕРАТУРЫ ПЕЧИ И БЛЕНДИНГА**")
+    st.info("**ЭНЕРГОСБЕРЕЖЕНИЕ: ОПТИМИЗАЦИЯ ТЕМПЕРАТУРЫ ПЕЧИ И БЛЕНДИНГА**")
 
 elif status == "OPTIMIZATION_OPPORTUNITY":
-    st.success("💰 **ЗОЛОТОЕ ОКНО: ВОЗМОЖНО УВЕЛИЧЕНИЕ ВЫРАБОТКИ**")
+    st.success("**ЗОЛОТОЕ ОКНО: ВОЗМОЖНО УВЕЛИЧЕНИЕ ВЫРАБОТКИ**")
 
 elif status == "ACTION_RECOMMENDED":
-    st.warning("⚠️ **ТРЕБУЕТСЯ УПРАВЛЯЮЩЕЕ ВОЗДЕЙСТВИЕ ДЛЯ ВЫВОДА В НОРМУ**")
+    st.warning("**ТРЕБУЕТСЯ УПРАВЛЯЮЩЕЕ ВОЗДЕЙСТВИЕ ДЛЯ ВЫВОДА В НОРМУ**")
 
 if status in ["ACTION_RECOMMENDED", "EQUIPMENT_OVERLOAD", "OPTIMIZATION_OPPORTUNITY", "ENERGY_OPTIMIZATION"]:
     c_left, c_right = st.columns([1, 1])
@@ -336,7 +336,7 @@ st.divider()
 # =====================================================================
 # ИНТЕРАКТИВНЫЙ БЛЕНДИНГ
 # =====================================================================
-st.subheader("🧪 Интерактивный резервуарный блендинг")
+st.subheader("Интерактивный резервуарный блендинг")
 b_col1, b_col2, b_col3 = st.columns(3)
 
 with b_col1:
